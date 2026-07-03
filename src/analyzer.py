@@ -1,8 +1,11 @@
 """
 Cross-sector rotation strategy for multi-ETF swing trading.
 
-For daily pre-market trade planning and paper trading, run pre_market_scanner.py.
-This module is the historical backtester only.
+Production rules live in ticker_config.py (QQQ park + swing sectors) and are
+simulated in swing_backtest_sandbox.py. This module keeps shared data utilities;
+run main() or swing_backtest_sandbox.py for backtests.
+
+For daily pre-market trade planning, run pre_market_scanner.py.
 """
 
 from dataclasses import dataclass
@@ -718,29 +721,34 @@ def align_universe(universe: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]
     return {ticker: universe[ticker].loc[master_index].copy() for ticker in tickers}
 
 
+def prune_short_history(
+    universe: dict[str, pd.DataFrame],
+    lookback_months: int | None,
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Drop tickers whose history starts after the backtest window would begin."""
+    if lookback_months is None or not universe:
+        return universe, []
+
+    window_end = max(df.index.max() for df in universe.values())
+    required_start = window_end - pd.DateOffset(months=lookback_months)
+
+    kept: dict[str, pd.DataFrame] = {}
+    excluded: list[str] = []
+    for ticker, df in sorted(universe.items()):
+        if df.index.min() > required_start:
+            excluded.append(ticker)
+        else:
+            kept[ticker] = df
+    return kept, excluded
+
+
 def main() -> None:
-    print("Historical backtester — for daily pre-market signals, run: python src/pre_market_scanner.py")
+    print("Historical backtester — QQQ park + swing rotation")
+    print("For daily pre-market signals, run: python src/pre_market_scanner.py")
     print()
-    scan_tickers = all_tickers()
-    loaded, missing = load_available_universe(scan_tickers)
-    scan_universe = align_universe(loaded)
+    from swing_backtest_sandbox import DEFAULT_CONFIG, print_report, run_simulation
 
-    if missing:
-        print("Error: incomplete universe — re-run download_data.py before backtesting.")
-        return
-
-    if not scan_universe:
-        print("Error: no ETF data found. Run download_data.py first.")
-        return
-
-    print_sector_matrix(scan_universe)
-
-    if len(scan_universe) < 2:
-        print("Error: need at least 2 tickers for rotation backtest.")
-        return
-
-    result = backtest_rotation(scan_universe)
-    print_rotation_backtest(result)
+    print_report(run_simulation(DEFAULT_CONFIG))
 
 
 if __name__ == "__main__":

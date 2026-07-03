@@ -23,31 +23,26 @@ import pandas as pd
 import pandas_ta as ta
 
 from analyzer import resolve_simulation_range
-from ticker_config import ANALYSIS_LOOKBACK_MONTHS
+from ticker_config import (
+    ANALYSIS_LOOKBACK_MONTHS,
+    MAXIMUM_SWING_POSITIONS,
+    PARK_TICKER,
+    RSI_OVERSOLD_THRESHOLD,
+    RSI_PERIOD,
+    SLIPPAGE_PCT,
+    SMA_TREND,
+    STARTING_CAPITAL,
+    STOP_LOSS_PCT,
+    SWING_ALLOCATION,
+    SWING_SECTORS,
+    TAKE_PROFIT_RSI,
+    swing_tickers,
+)
 
-# =============================================================================
-# Default hyperparameters (overridden by StrategyConfig in grid search)
-# =============================================================================
-RSI_PERIOD = 7
-RSI_OVERSOLD_THRESHOLD = 30
-TAKE_PROFIT_RSI = 70
-SMA_TREND = 200
-STOP_LOSS_PCT = 0.025
-SWING_ALLOCATION = 0.85         # total swing pool; split equally across up to 4 positions (~21% each)
-MAXIMUM_SWING_POSITIONS = 4
-SLIPPAGE_FEE = 0.0005
-STARTING_CAPITAL = 10_000.0
-PARK_TICKER = "QQQ"
-
-# Swing universe — sector ETFs only; QQQ is park-only (not ranked or traded as swing)
-SECTORS: dict[str, str] = {
-    "AI_INFRA": "SMH",
-    "ENERGY": "XLE",
-    "UTILITIES": "XLU",
-    "MACRO_ROTATION": "XLF",
-}
+# Re-export for grid_search_optimizer and legacy imports
+SECTORS = SWING_SECTORS
 SWING_TICKERS = [t for t in SECTORS.values() if t != PARK_TICKER]
-TICKERS = list(dict.fromkeys([PARK_TICKER, *SECTORS.values()]))
+TICKERS = swing_tickers()
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
@@ -62,7 +57,7 @@ class StrategyConfig:
     sma_trend: int = SMA_TREND
     swing_allocation: float = SWING_ALLOCATION
     maximum_swing_positions: int = MAXIMUM_SWING_POSITIONS
-    slippage_fee: float = SLIPPAGE_FEE
+    slippage_fee: float = SLIPPAGE_PCT
     starting_capital: float = STARTING_CAPITAL
     lookback_months: int | None = ANALYSIS_LOOKBACK_MONTHS
 
@@ -229,7 +224,7 @@ def _passes_oversold_entry(
     return _passes_macro_trend_filter(aligned, ticker, day_idx)
 
 
-def _bottom_n_sectors(
+def bottom_n_oversold_sectors(
     leaderboard: list[tuple[str, str, float]],
     n: int,
     aligned: dict[str, pd.DataFrame],
@@ -243,6 +238,16 @@ def _bottom_n_sectors(
         if _passes_oversold_entry(aligned, item[1], day_idx, item[2], config)
     ]
     return eligible[:n]
+
+
+def _bottom_n_sectors(
+    leaderboard: list[tuple[str, str, float]],
+    n: int,
+    aligned: dict[str, pd.DataFrame],
+    day_idx: int,
+    config: StrategyConfig,
+) -> list[tuple[str, str, float]]:
+    return bottom_n_oversold_sectors(leaderboard, n, aligned, day_idx, config)
 
 
 # =============================================================================
@@ -756,6 +761,7 @@ def print_report(result: BacktestResult) -> None:
 
 
 def main() -> None:
+    """Production backtest entry point (also: python src/analyzer.py)."""
     print_report(run_simulation(DEFAULT_CONFIG))
 
 

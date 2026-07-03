@@ -1,12 +1,12 @@
 """
-Pre-Market Alpha Scanner — forward-looking daily decision tool.
+Pre-Market Alpha Scanner — QQQ park + swing sector rotation.
 
 Evening workflow (California / PT, after ~1 PM market close):
   1. Ask Agent to sync Robinhood → output/positions.json (see POSITIONS_SYNC_PROMPT)
   2. python src/pre_market_scanner.py
 
 Auto-downloads stale CSVs. Writes output/latest_signals.json.
-SELL signals only appear for symbols in positions.json when that file exists.
+SELL signals only appear for swing symbols in positions.json when that file exists.
 For historical backtesting, run analyzer.py or swing_backtest_sandbox.py.
 """
 
@@ -23,20 +23,28 @@ import pandas as pd
 from pandas.tseries.offsets import BDay
 
 from download_data import ensure_fresh_data, expected_completed_session, is_market_data_stale
-from analyzer import (
-    MAX_POSITIONS,
-    POSITION_ALLOC_PCT,
-    RSI_OVEREXTENDED,
-    SLIPPAGE_PCT,
-    align_universe,
-    find_missing_tickers,
-    load_available_universe,
-    load_raw_prices,
-    print_missing_data_report,
+from analyzer import find_missing_tickers, load_raw_prices, print_missing_data_report
+from swing_backtest_sandbox import (
+    DEFAULT_CONFIG,
+    build_rsi_leaderboard,
+    bottom_n_oversold_sectors,
+    load_and_prepare,
 )
-from ticker_config import LEVERAGED_EXEC, TICKER_CONFIG, all_tickers, execution_ticker, theme_for_ticker
+from ticker_config import (
+    MAXIMUM_SWING_POSITIONS,
+    PARK_TICKER,
+    SLIPPAGE_PCT,
+    STOP_LOSS_PCT,
+    SWING_ALLOCATION,
+    SWING_SECTORS,
+    TAKE_PROFIT_RSI,
+    execution_ticker,
+    is_park_symbol,
+    scanner_tickers,
+    swing_sector_for_ticker,
+    swing_tickers,
+)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 SIGNALS_JSON_PATH = OUTPUT_DIR / "latest_signals.json"
 POSITIONS_JSON_PATH = OUTPUT_DIR / "positions.json"
@@ -53,10 +61,10 @@ Steps:
      "synced_at": "<ISO-8601 UTC>",
      "positions": [
        {
-         "symbol": "IXC",
-         "quantity": 1.015,
-         "shares_available_for_sells": 1.015,
-         "average_buy_price": 49.25
+         "symbol": "QQQ",
+         "quantity": 10.5,
+         "shares_available_for_sells": 10.5,
+         "average_buy_price": 480.25
        }
      ]
    }
@@ -78,6 +86,8 @@ class TradeAction:
     est_fill_price: float
     shares: float = 0.0
     notional: float = 0.0
+    park_extract_pct: float = 0.0
+    repark_to_qqq: bool = False
 
 
 def _apply_entry_slippage(price: float) -> float:
@@ -95,20 +105,10 @@ def _est_open_price(exec_ticker: str, price_data: dict[str, pd.DataFrame]) -> fl
     return float(price_data[exec_ticker]["Close"].iloc[-1])
 
 
-def _sentiment_text(row: pd.Series) -> str:
-    if bool(row["deep_buy"]):
-        return f"deeply oversold (RSI {float(row['RSI_7']):.1f})"
-    if bool(row["buy_pullback"]):
-        return f"oversold pullback (RSI {float(row['RSI_7']):.1f})"
-    if bool(row["overextended"]):
-        return f"overextended (RSI {float(row['RSI_7']):.1f})"
-    return f"neutral (RSI {float(row['RSI_7']):.1f})"
-
-
-def build_universe_clean() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], pd.Timestamp]:
-    """Load aligned signal data (T-1) and execution price references."""
-    expected = all_tickers()
-    missing = find_missing_tickers(expected)
+def build_swing_universe() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], pd.Timestamp]:
+    """Load aligned swing data (RSI + SMA) and raw price references."""
+    required = scanner_tickers()
+    missing = find_missing_tickers(required)
     if missing:
         print_missing_data_report(missing)
         raise FileNotFoundError(
@@ -116,15 +116,10 @@ def build_universe_clean() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFr
             "Run: python src/download_data.py"
         )
 
-    available, _ = load_available_universe(expected, report_missing=False)
-    signal_tickers = [t for t in available if t not in {"SOXL", "TQQQ"}]
-    signal_universe = align_universe({t: available[t] for t in signal_tickers})
-    if not signal_universe:
-        raise FileNotFoundError("No ETF data found. Run download_data.py first.")
-
-    price_data = {t: load_raw_prices(t) for t in available}
-    signal_date = next(iter(signal_universe.values())).index[-1]
-    return signal_universe, price_data, signal_date
+    _, aligned = load_and_prepare(swing_tickers(), DEFAULT_CONFIG)
+    price_data = {t: load_raw_prices(t) for t in required}
+    signal_date = next(iter(aligned.values())).index[-1]
+    return aligned, price_data, signal_date
 
 
 def next_trading_day(signal_date: pd.Timestamp) -> date:
@@ -154,6 +149,16 @@ def _position_qty(position: dict) -> float:
     return 0.0
 
 
+def _position_avg_price(position: dict) -> float | None:
+    raw = position.get("average_buy_price")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def held_exec_symbols(snapshot: dict | None) -> set[str]:
     """Execution tickers currently held (sellable qty > 0)."""
     if not snapshot:
@@ -166,23 +171,29 @@ def held_exec_symbols(snapshot: dict | None) -> set[str]:
     return held
 
 
-def held_themes(snapshot: dict | None) -> set[str]:
-    """Themes already occupied by open Robinhood positions."""
-    themes: set[str] = set()
+def held_swing_sectors(snapshot: dict | None) -> set[str]:
+    """Swing sectors occupied by open Robinhood positions (excludes QQQ park)."""
+    sectors: set[str] = set()
     for symbol in held_exec_symbols(snapshot):
-        theme = theme_for_ticker(symbol)
-        if theme:
-            themes.add(theme)
-        for signal_ticker, exec_ticker in LEVERAGED_EXEC.items():
-            if exec_ticker == symbol:
-                signal_theme = theme_for_ticker(signal_ticker)
-                if signal_theme:
-                    themes.add(signal_theme)
-    return themes
+        if is_park_symbol(symbol):
+            continue
+        sector = swing_sector_for_ticker(symbol)
+        if sector:
+            sectors.add(sector)
+    return sectors
+
+
+def _position_for_symbol(snapshot: dict | None, symbol: str) -> dict | None:
+    if not snapshot:
+        return None
+    for pos in snapshot.get("positions", []):
+        if pos.get("symbol") == symbol:
+            return pos
+    return None
 
 
 def generate_signals(
-    signal_universe: dict[str, pd.DataFrame],
+    aligned: dict[str, pd.DataFrame],
     price_data: dict[str, pd.DataFrame],
     signal_date: pd.Timestamp,
     execution_date: date,
@@ -190,172 +201,148 @@ def generate_signals(
 ) -> list[TradeAction]:
     """Build buy/sell advisories from the signal close for the next session open."""
     actions: list[TradeAction] = []
-    idx = next(iter(signal_universe.values())).index.get_loc(signal_date)
-    if idx < 1:
-        return actions
-
-    per_slot_notional = SUGGESTED_CAPITAL * POSITION_ALLOC_PCT
+    idx = next(iter(aligned.values())).index.get_loc(signal_date)
     held_symbols = held_exec_symbols(positions)
-    themes_in_use = held_themes(positions)
+    held_sectors = held_swing_sectors(positions)
 
-    # --- Exits: only for symbols you actually hold (when positions.json present) ---
-    deep_buyers = [
-        t for t in signal_universe if bool(signal_universe[t].iloc[idx]["deep_buy"])
-    ]
-    for ticker, df in signal_universe.items():
-        row = df.iloc[idx]
-        prev = df.iloc[idx - 1]
-        prev_rsi = float(prev["RSI_7"])
-        rsi = float(row["RSI_7"])
-        theme = theme_for_ticker(ticker) or ticker
-        exec_t = execution_ticker(ticker)
-        if exec_t not in price_data:
+    # --- Swing exits: take profit or stop loss on held swing positions ---
+    for sector, signal_ticker in SWING_SECTORS.items():
+        exec_t = execution_ticker(signal_ticker)
+        if positions is None or exec_t not in held_symbols:
             continue
+
+        row = aligned[signal_ticker].iloc[idx]
+        rsi = float(row["RSI"])
+        close = float(row["Adj Close"])
+        pos = _position_for_symbol(positions, exec_t)
+        held_qty = _position_qty(pos) if pos else 0.0
+        avg_buy = _position_avg_price(pos) if pos else None
 
         exit_reason = ""
-        if prev_rsi <= RSI_OVEREXTENDED < rsi:
+        if rsi >= TAKE_PROFIT_RSI:
             exit_reason = "take_profit_rsi"
-        elif bool(row["overextended"]) and deep_buyers:
-            rot = next((t for t in deep_buyers if theme_for_ticker(t) != theme), None)
-            if rot:
-                exit_reason = f"rotation_to_{rot}"
+        elif avg_buy is not None and close <= avg_buy * (1 - STOP_LOSS_PCT):
+            exit_reason = "stop_loss"
 
-        if exit_reason:
-            if positions is None or exec_t not in held_symbols:
-                continue
-            held_qty = 0.0
-            if positions:
-                for pos in positions.get("positions", []):
-                    if pos.get("symbol") == exec_t:
-                        held_qty = _position_qty(pos)
-                        break
-            fill = _apply_exit_slippage(_est_open_price(exec_t, price_data))
-            headline = f"SELL {exec_t} at {execution_date} open — {exit_reason}"
-            if held_qty > 0:
-                headline = (
-                    f"SELL {held_qty:.4f} sh {exec_t} at {execution_date} open — {exit_reason}"
-                )
-            actions.append(
-                TradeAction(
-                    action="SELL",
-                    signal_ticker=ticker,
-                    exec_ticker=exec_t,
-                    theme=theme,
-                    reason=exit_reason,
-                    headline=headline,
-                    est_fill_price=fill,
-                    shares=held_qty,
-                    notional=held_qty * fill if held_qty > 0 else 0.0,
-                )
+        if not exit_reason:
+            continue
+
+        fill = _apply_exit_slippage(_est_open_price(exec_t, price_data))
+        headline = (
+            f"SELL {held_qty:.4f} sh {exec_t} at {execution_date} open — {exit_reason}; "
+            f"repark proceeds to {PARK_TICKER}"
+        )
+        actions.append(
+            TradeAction(
+                action="SELL",
+                signal_ticker=signal_ticker,
+                exec_ticker=exec_t,
+                theme=sector,
+                reason=exit_reason,
+                headline=headline,
+                est_fill_price=fill,
+                shares=held_qty,
+                notional=held_qty * fill if held_qty > 0 else 0.0,
+                repark_to_qqq=True,
             )
+        )
 
-    # --- Entries: skip themes/symbols already held ---
-    held_count = (
-        sum(1 for p in positions.get("positions", []) if _position_qty(p) > 0)
-        if positions
-        else 0
+    # --- Swing entries: lowest RSI oversold sectors above SMA 200 ---
+    held_swing_count = len(held_sectors)
+    open_slots = max(0, MAXIMUM_SWING_POSITIONS - held_swing_count)
+    if open_slots <= 0:
+        return actions
+
+    leaderboard = build_rsi_leaderboard(aligned, idx)
+    candidates = bottom_n_oversold_sectors(
+        leaderboard, open_slots, aligned, idx, DEFAULT_CONFIG
     )
-    open_slots = max(0, MAX_POSITIONS - held_count)
+    candidates = [
+        (sector, ticker, rsi)
+        for sector, ticker, rsi in candidates
+        if sector not in held_sectors
+    ]
+    if not candidates:
+        return actions
 
-    pullback_candidates = []
-    for ticker, df in signal_universe.items():
-        row = df.iloc[idx]
-        if not bool(row["buy_pullback"]):
-            continue
-        theme = theme_for_ticker(ticker) or ticker
-        if theme in themes_in_use:
-            continue
-        exec_t = execution_ticker(ticker)
-        if exec_t not in price_data:
-            continue
+    park_extract_pct = SWING_ALLOCATION / len(candidates)
+    per_slot_notional = SUGGESTED_CAPITAL * park_extract_pct
+
+    for sector, signal_ticker, rsi in candidates:
+        exec_t = execution_ticker(signal_ticker)
         if exec_t in held_symbols:
             continue
-        pullback_candidates.append((float(row["rs_score"]), ticker, theme, row))
-
-    pullback_candidates.sort(reverse=True, key=lambda x: x[0])
-
-    overextended = [
-        (t, signal_universe[t].iloc[idx])
-        for t in signal_universe
-        if bool(signal_universe[t].iloc[idx]["overextended"])
-    ]
-    strongest = max(overextended, key=lambda item: float(item[1]["RSI_7"])) if overextended else None
-
-    for _, ticker, theme, row in pullback_candidates[:open_slots]:
-        exec_t = execution_ticker(ticker)
         fill = _apply_entry_slippage(_est_open_price(exec_t, price_data))
         shares = per_slot_notional / fill
-
-        rotation_note = ""
-        if strongest and strongest[0] != ticker:
-            rot_t, rot_row = strongest
-            rotation_note = (
-                f"{ticker} is {_sentiment_text(row)} relative to "
-                f"{rot_t} ({_sentiment_text(rot_row)}). "
-            )
-
-        leverage_note = f" via {exec_t}" if exec_t != ticker else ""
+        leverage_note = f" via {exec_t}" if exec_t != signal_ticker else ""
         actions.append(
             TradeAction(
                 action="BUY",
-                signal_ticker=ticker,
+                signal_ticker=signal_ticker,
                 exec_ticker=exec_t,
-                theme=theme,
-                reason="buy_pullback",
+                theme=sector,
+                reason="swing_oversold",
                 headline=(
-                    f"BUY{leverage_note} at {execution_date} market open — "
-                    f"{rotation_note}"
-                    f"RS score {float(row['rs_score']):.1f}, above SMA 200"
+                    f"BUY{leverage_note} at {execution_date} open — "
+                    f"RSI {rsi:.1f} < {DEFAULT_CONFIG.rsi_oversold_threshold:.0f}, above SMA 200; "
+                    f"trim {PARK_TICKER} park ~{park_extract_pct:.0%} to fund"
                 ),
                 est_fill_price=fill,
                 shares=shares,
                 notional=per_slot_notional,
+                park_extract_pct=park_extract_pct,
             )
         )
-        themes_in_use.add(theme)
 
     return actions
 
 
 def print_watchlist(
-    signal_universe: dict[str, pd.DataFrame],
+    aligned: dict[str, pd.DataFrame],
     signal_date: pd.Timestamp,
     trade_date: date,
     actions: list[TradeAction],
     positions: dict | None = None,
 ) -> None:
+    idx = next(iter(aligned.values())).index.get_loc(signal_date)
+    leaderboard = build_rsi_leaderboard(aligned, idx)
+
     print()
     print("=" * 88)
-    print("PRE-MARKET ALPHA SCANNER")
+    print("PRE-MARKET SCANNER — QQQ PARK + SWING ROTATION")
     print("=" * 88)
     print(f"Signal session (T)   : {signal_date.date()}  (last closed trading day)")
     print(f"Execution session    : {trade_date.isoformat()}  (next market open)")
-    print(f"Universe scanned     : {len(signal_universe)} ETFs across {len(TICKER_CONFIG)} themes")
+    print(f"Park asset           : {PARK_TICKER}  (core; trim to fund swings)")
+    swing_list = ", ".join(SWING_SECTORS.values())
+    print(f"Swing universe       : {swing_list}")
+    print(f"Entry rule           : RSI < {DEFAULT_CONFIG.rsi_oversold_threshold:.0f} AND Close > SMA_{DEFAULT_CONFIG.sma_trend}")
+    print(f"Exit rule            : RSI >= {TAKE_PROFIT_RSI:.0f} or {STOP_LOSS_PCT:.1%} stop")
     print(f"Data through         : {signal_date.date()}  (expected ≤ {expected_completed_session()})")
-    print(f"Sizing reference     : ${SUGGESTED_CAPITAL:,.0f} @ {POSITION_ALLOC_PCT:.0%} per slot (display only)")
+    print(
+        f"Sizing reference     : ${SUGGESTED_CAPITAL:,.0f} @ up to "
+        f"{SWING_ALLOCATION:.0%} swing pool / {MAXIMUM_SWING_POSITIONS} slots (display only)"
+    )
     if positions:
         synced = positions.get("synced_at", "?")
         held = held_exec_symbols(positions)
-        print(f"Robinhood positions  : {len(held)} held ({', '.join(sorted(held)) or 'none'}) — synced {synced}")
+        park = sorted(s for s in held if is_park_symbol(s))
+        swings = sorted(s for s in held if swing_sector_for_ticker(s))
+        print(f"Robinhood park       : {', '.join(park) or 'none'} — synced {synced}")
+        print(f"Robinhood swings     : {', '.join(swings) or 'none'}")
     else:
         print("Robinhood positions  : not synced (SELL signals disabled; run Agent sync first)")
     print()
 
     print("-" * 88)
-    print("RELATIVE STRENGTH SNAPSHOT (signal close)")
+    print("SWING RSI LEADERBOARD (lowest = most oversold)")
     print("-" * 88)
-    ranked = sorted(
-        signal_universe.items(),
-        key=lambda item: float(item[1].iloc[-1]["rs_score"]),
-        reverse=True,
-    )
-    for ticker, df in ranked[:5]:
-        row = df.iloc[-1]
-        theme = theme_for_ticker(ticker) or "?"
-        print(
-            f"  {ticker:5s} [{theme:14s}]  RS={float(row['rs_score']):5.1f}  "
-            f"RSI={float(row['RSI_7']):5.1f}  {_sentiment_text(row)}"
-        )
+    for sector, ticker, rsi in leaderboard:
+        row = aligned[ticker].iloc[idx]
+        sma = row["SMA_200"]
+        above = float(row["Adj Close"]) > float(sma) if pd.notna(sma) else False
+        flag = "ENTRY OK" if rsi < DEFAULT_CONFIG.rsi_oversold_threshold and above else "watch"
+        print(f"  {ticker:5s} [{sector:14s}]  RSI={rsi:5.1f}  {flag}")
     print()
 
     print("=" * 88)
@@ -363,7 +350,7 @@ def print_watchlist(
     print("=" * 88)
 
     if not actions:
-        print("\nNo actionable signals for today's open.\n")
+        print("\nNo actionable swing signals for today's open (QQQ park unchanged).\n")
     else:
         for i, act in enumerate(actions, 1):
             icon = "🚨" if act.action == "BUY" else "🔻"
@@ -374,6 +361,10 @@ def print_watchlist(
             print(f"   Execute ETF  : {act.exec_ticker}")
             print(f"   Reason       : {act.reason}")
             print(f"   PRE-MARKET ACTION: {act.headline}")
+            if act.park_extract_pct:
+                print(f"   Park trim    : ~{act.park_extract_pct:.0%} of {PARK_TICKER}")
+            if act.repark_to_qqq:
+                print(f"   Repark       : proceeds → {PARK_TICKER}")
             if act.shares:
                 print(
                     f"   Est. fill    : ${act.est_fill_price:,.2f}  "
@@ -395,12 +386,16 @@ def save_signals_json(
 ) -> Path:
     """Write signals for next-morning Robinhood MCP / automation handoff."""
     payload = {
+        "strategy": "qqq_park_swing",
+        "park_ticker": PARK_TICKER,
+        "swing_allocation": SWING_ALLOCATION,
+        "maximum_swing_positions": MAXIMUM_SWING_POSITIONS,
         "signal_date": signal_date.date().isoformat(),
         "execution_date": execution_date.isoformat(),
         "suggested_capital": SUGGESTED_CAPITAL,
-        "position_alloc_pct": POSITION_ALLOC_PCT,
         "positions_synced": positions is not None,
         "held_symbols": sorted(held_exec_symbols(positions)),
+        "swing_sectors": sorted(SWING_SECTORS.keys()),
         "actions": [asdict(a) for a in actions],
     }
     if positions:
@@ -443,7 +438,7 @@ def main() -> None:
                 "Re-run without --no-download to refresh.\n"
             )
     try:
-        signal_universe, price_data, signal_date = build_universe_clean()
+        aligned, price_data, signal_date = build_swing_universe()
     except FileNotFoundError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
@@ -451,9 +446,9 @@ def main() -> None:
     execution_date = next_trading_day(signal_date)
     positions = load_positions_snapshot()
     actions = generate_signals(
-        signal_universe, price_data, signal_date, execution_date, positions
+        aligned, price_data, signal_date, execution_date, positions
     )
-    print_watchlist(signal_universe, signal_date, execution_date, actions, positions)
+    print_watchlist(aligned, signal_date, execution_date, actions, positions)
 
     out = save_signals_json(signal_date, execution_date, actions, positions)
     print(f"Signals saved → {out}")
